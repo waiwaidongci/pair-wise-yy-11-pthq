@@ -28,7 +28,7 @@ import MachineInspector from '../components/MachineInspector'
 import MachineSidebar from '../components/MachineSidebar'
 import SimulationPanel from '../components/SimulationPanel'
 import { useMachineStore } from '../stores/machine'
-import type { MachineDocument } from '../types/machine'
+import type { MachineDocumentLike } from '../types/machine'
 import { compileMachine, mermaidDiagram, xstateConfig } from '../utils/machine'
 
 export default function EditorView() {
@@ -63,8 +63,8 @@ export default function EditorView() {
   }
 
   function exportJson() {
-    const document: MachineDocument = {
-      version: 1,
+    const document = {
+      version: 2 as const,
       name: store.name,
       nodes: store.nodes,
       edges: store.edges,
@@ -76,7 +76,7 @@ export default function EditorView() {
 
   async function importJson(file: File) {
     try {
-      const document = JSON.parse(await file.text()) as MachineDocument
+      const document = JSON.parse(await file.text()) as MachineDocumentLike
       if (!Array.isArray(document.nodes) || !Array.isArray(document.edges)) throw new Error('JSON 缺少 nodes 或 edges')
       store.loadDocument(document)
     } catch (error) {
