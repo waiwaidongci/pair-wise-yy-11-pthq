@@ -1,19 +1,31 @@
-import { Box, Button, IconButton, MenuItem, Stack, TextField, Typography } from '@mui/material'
+import { Box, Button, Chip, IconButton, MenuItem, Stack, TextField, Typography } from '@mui/material'
 import { Add, DeleteOutline, FlagOutlined, PlayArrowOutlined, StopOutlined } from '@mui/icons-material'
 import { useMachineStore } from '../stores/machine'
+import { getBranches } from '../utils/machine'
 
 export default function MachineSidebar() {
   const store = useMachineStore()
   const selected = store.nodes.find((node) => node.id === store.selectedNodeId)
   const parentId = selected?.data.kind === 'compound' ? selected.id : null
+  const branches = parentId ? getBranches(store.nodes, parentId) : []
+  const currentBranchIndex = branches.findIndex((b) => b.branchId === store.selectedBranchId)
 
   return (
     <aside className="side-panel">
       <Typography variant="subtitle2">状态组件</Typography>
       <Typography variant="caption" color="text.secondary">添加到根节点，或添加到当前选中的复合状态</Typography>
+      {parentId && (
+        <Chip
+          size="small"
+          color="secondary"
+          variant="outlined"
+          label={currentBranchIndex >= 0 ? `将添加到：支路 ${currentBranchIndex + 1}` : '将添加到：默认支路'}
+          sx={{ mt: 1 }}
+        />
+      )}
       <Stack spacing={0.8} sx={{ my: 1.4 }}>
         <Button variant="outlined" startIcon={<FlagOutlined />} onClick={() => store.addState('simple', parentId)}>普通状态</Button>
-        <Button variant="outlined" startIcon={<PlayArrowOutlined />} onClick={() => store.addState('compound', null)}>复合状态 / 子状态容器</Button>
+        <Button variant="outlined" startIcon={<PlayArrowOutlined />} onClick={() => store.addState('compound', null)}>复合状态 / 并行容器</Button>
         <Button variant="outlined" startIcon={<StopOutlined />} onClick={() => store.addState('final', parentId)}>结束状态</Button>
       </Stack>
       <Box className="sidebar-tip">

@@ -34,6 +34,13 @@ html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 .compound-title { display: flex; justify-content: space-between; padding: 9px 12px; color: #5b21b6; background: rgba(221,214,254,.75); border-radius: 9px 9px 0 0; font-size: 12px; font-weight: 700; }
 .compound-title small { font-weight: 400; }
 .compound-body { padding: 12px; color: #8b5cf6; font-size: 11px; }
+.branch-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.branch-chip { padding: 2px 8px; border: 1px solid #c4b5fd; border-radius: 10px; background: rgba(255,255,255,.7); font-size: 10px; }
+.branch-tag { margin-left: auto; padding: 1px 6px; border-radius: 8px; background: #ede9fe; color: #6d28d9; font-size: 9px; }
+.branch-manager { display: grid; gap: 6px; padding: 8px; border: 1px solid #e3e8ef; border-radius: 6px; background: #f9fbfd; }
+.branch-row { display: grid; gap: 3px; padding: 6px 8px; border: 1px solid #e3e8ef; border-radius: 5px; background: #fff; cursor: pointer; }
+.branch-row.selected { border-color: #7c3aed; background: #f5f3ff; }
+.trace-item.conflict { border-left-color: #f59e0b; background: #fffbeb; }
 .edge-label { position: absolute; padding: 3px 7px; border: 1px solid #c6d0dd; border-radius: 10px; color: #44536a; background: white; box-shadow: 0 2px 7px rgba(30,45,65,.08); font-size: 10px; pointer-events: none; }
 .simulation-panel { min-height: 0; overflow: hidden; display: flex; flex-direction: column; padding: 12px; background: #fff; }
 .simulation-head { display: flex; align-items: flex-start; justify-content: space-between; }

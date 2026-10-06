@@ -1,5 +1,5 @@
 import { createMachine } from 'xstate'
-import type { ContextValue, MachineDocument, StateNode, TransitionEdge, ValidationIssue } from '../types/machine'
+import type { ContextValue, MachineDocument, StateNode, StateNodeData, TraceEntry, TransitionEdge, ValidationIssue } from '../types/machine'
 
 export function sendEventId() {
   return `event-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
@@ -112,6 +112,260 @@ export function evaluateCondition(condition: string, context: Record<string, Con
   }))
 }
 
+/** 生成并行支路 id */
+export function branchId() {
+  return `branch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+}
+
+/** 取子状态所属支路 id（兼容旧数据：无 branchId 时归入 default） */
+export function branchIdOf(node: StateNode | StateNodeData): string {
+  const data = ('data' in node ? node.data : node) as StateNodeData
+  return data.branchId ?? 'default'
+}
+
+/** 判断节点是否为复合状态下的子状态 */
+export function isChildNode(node: StateNode): boolean {
+  return Boolean(node.parentId)
+}
+
+/** 找节点的父复合状态 id */
+export function compoundParentId(node: StateNode, nodes: StateNode[]): string | null {
+  if (!node.parentId) return null
+  const parent = nodes.find((item) => item.id === node.parentId && item.data.kind === 'compound')
+  return parent ? parent.id : null
+}
+
+/** 将复合状态的子状态按支路分组，保持插入顺序 */
+export function getBranches(nodes: StateNode[], compoundId: string): Array<{ branchId: string; nodes: StateNode[] }> {
+  const children = nodes.filter((node) => node.parentId === compoundId)
+  const order: string[] = []
+  const map = new Map<string, StateNode[]>()
+  children.forEach((child) => {
+    const bid = branchIdOf(child)
+    if (!map.has(bid)) {
+      map.set(bid, [])
+      order.push(bid)
+    }
+    map.get(bid)!.push(child)
+  })
+  return order.map((bid) => ({ branchId: bid, nodes: map.get(bid)! }))
+}
+
+/** 支路是否已到达结束（当前激活子状态为 final） */
+export function isBranchDone(nodes: StateNode[], branchNodes: StateNode[], active: Set<string>): boolean {
+  return branchNodes.some((node) => active.has(node.id) && node.data.kind === 'final')
+}
+
+/** 复合状态的所有支路是否都已结束 */
+export function isCompoundDone(nodes: StateNode[], compoundId: string, active: Set<string>): boolean {
+  const branches = getBranches(nodes, compoundId)
+  if (!branches.length) return false
+  return branches.every((branch) => isBranchDone(nodes, branch.nodes, active))
+}
+
+/** 进入一个状态：激活自身，若为复合状态则递归激活每条支路的初始子状态 */
+export function enterState(nodeId: string, nodes: StateNode[], active: Set<string>): void {
+  active.add(nodeId)
+  const node = nodes.find((item) => item.id === nodeId)
+  if (node?.data.kind !== 'compound') return
+  getBranches(nodes, nodeId).forEach((branch) => {
+    const initial = branch.nodes.find((item) => item.data.initial) ?? branch.nodes[0]
+    if (initial) enterState(initial.id, nodes, active)
+  })
+}
+
+/** 退出一个状态及其所有后代 */
+export function exitState(nodeId: string, nodes: StateNode[], active: Set<string>): void {
+  active.delete(nodeId)
+  nodes.filter((node) => node.parentId === nodeId).forEach((child) => exitState(child.id, nodes, active))
+}
+
+/** 计算初始激活配置：从根初始状态起步，递归进入复合状态 */
+export function initialActiveStates(nodes: StateNode[]): string[] {
+  const rootInitial = nodes.find((node) => !node.parentId && node.data.initial)
+    ?? nodes.find((node) => !node.parentId && node.data.kind !== 'compound')
+  if (!rootInitial) return []
+  const active = new Set<string>()
+  enterState(rootInitial.id, nodes, active)
+  return Array.from(active)
+}
+
+/** 判断两个节点是否属于同一条支路（同一复合状态下的同一 branchId） */
+export function sameBranch(a: StateNode, b: StateNode): boolean {
+  if (!a.parentId || !b.parentId) return a.parentId === b.parentId
+  return a.parentId === b.parentId && branchIdOf(a) === branchIdOf(b)
+}
+
+/** 守卫优先级选择：有守卫优先于无守卫；同优先级命中多条且排不出先后时标记冲突 */
+export function selectByGuardPriority(
+  edges: TransitionEdge[],
+  context: Record<string, ContextValue>,
+): { selected: TransitionEdge | null; conflict: boolean; conflictEdges: string[] } {
+  const guarded = edges.filter((edge) => String(edge.data?.condition ?? '').trim() !== '')
+  const unguarded = edges.filter((edge) => String(edge.data?.condition ?? '').trim() === '')
+  const guardedTrue = guarded.filter((edge) => evaluateCondition(String(edge.data?.condition ?? ''), context))
+  const unguardedTrue = unguarded.filter(() => true)
+
+  if (guardedTrue.length === 1) return { selected: guardedTrue[0], conflict: false, conflictEdges: [] }
+  if (guardedTrue.length > 1) {
+    return { selected: guardedTrue[0], conflict: true, conflictEdges: guardedTrue.map((edge) => edge.id) }
+  }
+  if (unguardedTrue.length === 1) return { selected: unguardedTrue[0], conflict: false, conflictEdges: [] }
+  if (unguardedTrue.length > 1) {
+    return { selected: unguardedTrue[0], conflict: true, conflictEdges: unguardedTrue.map((edge) => edge.id) }
+  }
+  return { selected: null, conflict: false, conflictEdges: [] }
+}
+
+export interface SimResult {
+  activeIds: string[]
+  entries: TraceEntry[]
+}
+
+/**
+ * 并行模拟：事件广播给所有激活支路。
+ * - 每条支路独立按守卫优先级选一条转移；
+ * - 某条支路先到结束不拖住其余支路；
+ * - 所有支路都结束后，复合状态可被外部转移退出。
+ */
+export function simulateEvent(
+  nodes: StateNode[],
+  edges: TransitionEdge[],
+  context: Record<string, ContextValue>,
+  activeIds: string[],
+  event: string,
+  makeId: () => string,
+): SimResult {
+  const active = new Set(activeIds)
+  const entries: TraceEntry[] = []
+  const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+
+  const pushEntry = (partial: Partial<TraceEntry> & { from: string; to: string; accepted: boolean }) => {
+    entries.push({
+      id: makeId(),
+      event,
+      condition: '',
+      action: '',
+      contextAfter: JSON.parse(JSON.stringify(context)) as Record<string, ContextValue>,
+      timestamp,
+      ...partial,
+    })
+  }
+
+  // 1. 收集各激活叶子节点的候选转移，按支路分组
+  const scopes = new Map<string, { leaf: StateNode; edges: TransitionEdge[] }>()
+  active.forEach((id) => {
+    const node = nodes.find((item) => item.id === id)
+    if (!node || node.data.kind === 'compound') return
+    const candidates = edges.filter((edge) => edge.source === id && String(edge.data?.event ?? '') === event)
+    if (!candidates.length) return
+    const compoundId = compoundParentId(node, nodes)
+    const scopeKey = compoundId ? `${compoundId}::${branchIdOf(node)}` : `root::${node.id}`
+    if (!scopes.has(scopeKey)) scopes.set(scopeKey, { leaf: node, edges: [] })
+    scopes.get(scopeKey)!.edges.push(...candidates)
+  })
+
+  const handledCompounds = new Set<string>()
+
+  // 2. 每条支路按守卫优先级选一条转移并应用
+  scopes.forEach(({ leaf, edges: candidates }, scopeKey) => {
+    const { selected, conflict, conflictEdges } = selectByGuardPriority(candidates, context)
+    const compoundId = compoundParentId(leaf, nodes)
+    if (compoundId) handledCompounds.add(compoundId)
+
+    if (!selected) {
+      const reason = candidates.length ? '守卫条件均未满足' : '当前状态没有订阅该事件'
+      pushEntry({ from: leaf.id, to: leaf.id, accepted: false, reason, branchId: compoundId ? branchIdOf(leaf) : undefined })
+      return
+    }
+
+    // 应用赋值
+    const nextContext = { ...context }
+    ;(selected.data?.assignments ?? []).forEach((assignment) => {
+      if (assignment.variable) nextContext[assignment.variable] = resolveValue(assignment.expression, nextContext)
+    })
+    Object.assign(context, nextContext)
+
+    const target = nodes.find((item) => item.id === selected.target)
+    const targetCompound = target ? compoundParentId(target, nodes) : null
+    const leavingCompound = compoundId && (!targetCompound || targetCompound !== compoundId || !sameBranch(leaf, target!))
+
+    if (leavingCompound) {
+      // 退出整个复合状态（所有支路一起退出）
+      exitState(compoundId!, nodes, active)
+      if (target) enterState(target.id, nodes, active)
+    } else {
+      // 支路内转移：退出当前叶子，进入目标（若目标为复合状态则递归激活）
+      active.delete(leaf.id)
+      nodes.filter((node) => node.parentId === leaf.id).forEach((child) => exitState(child.id, nodes, active))
+      if (target) enterState(target.id, nodes, active)
+    }
+
+    pushEntry({
+      from: leaf.id,
+      to: selected.target,
+      accepted: true,
+      condition: String(selected.data?.condition ?? ''),
+      action: String(selected.data?.action ?? ''),
+      conflict,
+      conflictEdges: conflict ? conflictEdges : undefined,
+      branchId: compoundId ? branchIdOf(leaf) : undefined,
+      reason: conflict ? '多条转移守卫排不出先后，已取第一条' : undefined,
+    })
+  })
+
+  // 3. 复合状态退出转移：仅当没有任何支路处理该事件时触发
+  active.forEach((id) => {
+    const node = nodes.find((item) => item.id === id)
+    if (node?.data.kind !== 'compound') return
+    if (handledCompounds.has(id)) return
+    const exitCandidates = edges.filter((edge) => edge.source === id && String(edge.data?.event ?? '') === event)
+    if (!exitCandidates.length) return
+    const { selected, conflict, conflictEdges } = selectByGuardPriority(exitCandidates, context)
+    if (!selected) return
+
+    const nextContext = { ...context }
+    ;(selected.data?.assignments ?? []).forEach((assignment) => {
+      if (assignment.variable) nextContext[assignment.variable] = resolveValue(assignment.expression, nextContext)
+    })
+    Object.assign(context, nextContext)
+
+    const target = nodes.find((item) => item.id === selected.target)
+    exitState(id, nodes, active)
+    if (target) enterState(target.id, nodes, active)
+
+    pushEntry({
+      from: id,
+      to: selected.target,
+      accepted: true,
+      condition: String(selected.data?.condition ?? ''),
+      action: String(selected.data?.action ?? ''),
+      conflict,
+      conflictEdges: conflict ? conflictEdges : undefined,
+      reason: conflict ? '多条退出转移守卫排不出先后，已取第一条' : undefined,
+    })
+  })
+
+  // 4. 没有任何状态处理该事件
+  if (!entries.length) {
+    pushEntry({ from: activeIds[0] ?? '', to: activeIds[0] ?? '', accepted: false, reason: '当前激活状态均未订阅该事件' })
+  }
+
+  return { activeIds: Array.from(active), entries }
+}
+
+/** 将旧版单支路文档升级为并行结构：复合状态下的子状态补 branchId */
+export function migrateDocument(document: MachineDocument): MachineDocument {
+  if (document.version >= 2) return document
+  const nodes = document.nodes.map((node) => {
+    if (!node.parentId) return node
+    // 旧版复合状态只有一条支路，统一归入 default 支路
+    return { ...node, data: { ...node.data, branchId: node.data.branchId ?? 'default' } }
+  })
+  return { ...document, version: 2, nodes }
+}
+
+
 export function validateMachine(nodes: StateNode[], edges: TransitionEdge[]): ValidationIssue[] {
   const issues: ValidationIssue[] = []
   const rootNodes = nodes.filter((node) => !node.parentId && node.data.kind !== 'compound')
@@ -143,17 +397,30 @@ export function validateMachine(nodes: StateNode[], edges: TransitionEdge[]): Va
   })
 
   nodes.filter((node) => node.data.kind === 'compound').forEach((node) => {
-    const children = nodes.filter((child) => child.parentId === node.id)
-    if (!children.length) {
+    const branches = getBranches(nodes, node.id)
+    if (!branches.length) {
       issues.push({ id: `empty-${node.id}`, severity: 'warning', title: '复合状态为空', detail: `“${node.data.label}”尚未配置子状态。`, nodeId: node.id })
-    } else if (!children.some((child) => child.data.initial)) {
-      issues.push({ id: `child-initial-${node.id}`, severity: 'warning', title: '缺少子状态初始项', detail: `“${node.data.label}”需要标记一个初始子状态。`, nodeId: node.id })
+      return
     }
+    branches.forEach((branch) => {
+      if (!branch.nodes.some((child) => child.data.initial)) {
+        issues.push({
+          id: `branch-initial-${node.id}-${branch.branchId}`,
+          severity: 'warning',
+          title: '支路缺少初始项',
+          detail: `“${node.data.label}”的支路需要标记一个初始子状态。`,
+          nodeId: node.id,
+        })
+      }
+    })
   })
 
+  // 同一状态下同事件同条件的重复转移（按支路作用域）
   const groups = new Map<string, TransitionEdge[]>()
   edges.forEach((edge) => {
-    const key = `${edge.source}::${String(edge.data?.event ?? '')}::${String(edge.data?.condition ?? '')}`
+    const source = nodes.find((node) => node.id === edge.source)
+    const scope = source?.parentId ? `${source.parentId}::${branchIdOf(source)}` : 'root'
+    const key = `${scope}::${edge.source}::${String(edge.data?.event ?? '')}::${String(edge.data?.condition ?? '')}`
     groups.set(key, [...(groups.get(key) ?? []), edge])
   })
   groups.forEach((sameEdges) => {
@@ -173,6 +440,7 @@ export function validateMachine(nodes: StateNode[], edges: TransitionEdge[]): Va
 
 interface ExportStateConfig {
   initial?: string
+  type?: 'parallel' | 'final'
   states: Record<string, ExportStateConfig>
   on?: Record<string, { target: string } | Array<{ target: string }>>
 }
@@ -180,30 +448,49 @@ interface ExportStateConfig {
 export function xstateConfig(nodes: StateNode[], edges: TransitionEdge[], variables: MachineDocument['variables']) {
   const rootInitial = nodes.find((node) => !node.parentId && node.data.initial)?.id
     ?? nodes.find((node) => !node.parentId && node.data.kind !== 'compound')?.id
-  const states: Record<string, ExportStateConfig> = {}
-  nodes.filter((node) => !node.parentId).forEach((node) => {
-    const outgoing = edges.filter((edge) => edge.source === node.id)
+
+  const buildTransitions = (sourceId: string) => {
     const transitions: Record<string, Array<{ target: string }>> = {}
-    outgoing.forEach((edge) => {
+    edges.filter((edge) => edge.source === sourceId).forEach((edge) => {
       const event = String(edge.data?.event ?? 'EVENT')
       transitions[event] = [...(transitions[event] ?? []), { target: edge.target }]
     })
+    return transitions
+  }
+
+  const buildState = (node: StateNode): ExportStateConfig => {
     const children = nodes.filter((child) => child.parentId === node.id)
-    const childStates: Record<string, ExportStateConfig> = {}
-    children.forEach((child) => {
-      const childTransitions: Record<string, Array<{ target: string }>> = {}
-      edges.filter((edge) => edge.source === child.id).forEach((edge) => {
-        const event = String(edge.data?.event ?? 'EVENT')
-        childTransitions[event] = [...(childTransitions[event] ?? []), { target: edge.target }]
+    if (node.data.kind === 'compound' && children.length) {
+      const branches = getBranches(nodes, node.id)
+      const regionStates: Record<string, ExportStateConfig> = {}
+      branches.forEach((branch) => {
+        const regionName = `region_${branch.branchId.replace(/[^A-Za-z0-9_]/g, '_')}`
+        const regionChildStates: Record<string, ExportStateConfig> = {}
+        branch.nodes.forEach((child) => {
+          regionChildStates[child.id] = buildState(child)
+        })
+        regionStates[regionName] = {
+          initial: branch.nodes.find((child) => child.data.initial)?.id,
+          states: regionChildStates,
+        }
       })
-      childStates[child.id] = { states: {}, on: childTransitions }
-    })
-    states[node.id] = {
-      initial: children.find((child) => child.data.initial)?.id,
-      states: childStates,
-      on: transitions,
+      return {
+        type: 'parallel',
+        states: regionStates,
+        on: buildTransitions(node.id),
+      }
     }
+    if (node.data.kind === 'final') {
+      return { type: 'final', states: {}, on: buildTransitions(node.id) }
+    }
+    return { states: {}, on: buildTransitions(node.id) }
+  }
+
+  const states: Record<string, ExportStateConfig> = {}
+  nodes.filter((node) => !node.parentId).forEach((node) => {
+    states[node.id] = buildState(node)
   })
+
   const context = Object.fromEntries(variables.map((variable) => [variable.name, variable.initial]))
   const config: Record<string, unknown> = {
     id: 'StateBoardMachine',

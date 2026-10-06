@@ -6,15 +6,24 @@ import { useMachineStore } from '../stores/machine'
 export default function SimulationPanel() {
   const store = useMachineStore()
   const [customEvent, setCustomEvent] = useState('')
-  const current = store.nodes.find((node) => node.id === store.currentStateId)
-  const events = [...new Set(store.edges.filter((edge) => edge.source === store.currentStateId).map((edge) => String(edge.data?.event ?? '')))]
+  const activeLeaves = store.activeStateIds
+    .map((id) => store.nodes.find((node) => node.id === id))
+    .filter((node) => node && node.data.kind !== 'compound')
+  const activeLabels = activeLeaves.map((node) => node?.data.label ?? '').filter(Boolean)
+  const events = [...new Set(
+    store.activeStateIds
+      .flatMap((id) => store.edges.filter((edge) => edge.source === id))
+      .map((edge) => String(edge.data?.event ?? '')),
+  )]
 
   return (
     <section className="simulation-panel">
       <div className="simulation-head">
         <div>
           <Typography variant="subtitle2">状态模拟器</Typography>
-          <Typography variant="caption" color="text.secondary">当前：{current?.data.label ?? '未进入状态'}</Typography>
+          <Typography variant="caption" color="text.secondary">
+            当前激活：{activeLabels.length ? activeLabels.join('、') : '未进入状态'}
+          </Typography>
         </div>
         <Stack direction="row" spacing={0.6} alignItems="center">
           <Chip size="small" label={`事件轨迹 ${store.trace.length}`} />
@@ -44,10 +53,11 @@ export default function SimulationPanel() {
           const from = store.nodes.find((node) => node.id === entry.from)?.data.label ?? entry.from
           const to = store.nodes.find((node) => node.id === entry.to)?.data.label ?? entry.to
           return (
-            <div key={entry.id} className={`trace-item ${entry.accepted ? 'accepted' : 'rejected'}`}>
+            <div key={entry.id} className={`trace-item ${entry.accepted ? 'accepted' : 'rejected'} ${entry.conflict ? 'conflict' : ''}`}>
               <span className="trace-time">{entry.timestamp}</span>
               <strong>{entry.event}</strong>
               <span>{from} → {to}</span>
+              {entry.conflict && <Chip size="small" color="warning" label="守卫冲突" sx={{ height: 18, fontSize: 10 }} />}
               <small>{entry.reason || [entry.condition, entry.action].filter(Boolean).join(' / ') || '无条件动作'}</small>
             </div>
           )

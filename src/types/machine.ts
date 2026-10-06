@@ -9,6 +9,8 @@ export interface StateNodeData extends Record<string, unknown> {
   description: string
   initial: boolean
   isGroup?: boolean
+  /** 并行支路 id：复合状态下同一 branchId 的子状态属于同一条支路 */
+  branchId?: string
 }
 
 export type StateNode = Node<StateNodeData, 'state'>
@@ -44,6 +46,12 @@ export interface TraceEntry {
   timestamp: string
   accepted: boolean
   reason?: string
+  /** 命中多条转移且守卫排不出先后时为 true */
+  conflict?: boolean
+  /** 发生冲突时相互竞争的转移 id */
+  conflictEdges?: string[]
+  /** 该转移所属的并行支路 id */
+  branchId?: string
 }
 
 export type IssueSeverity = 'error' | 'warning'
@@ -58,7 +66,7 @@ export interface ValidationIssue {
 }
 
 export interface MachineDocument {
-  version: 1
+  version: 1 | 2
   name: string
   nodes: StateNode[]
   edges: TransitionEdge[]
